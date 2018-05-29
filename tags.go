@@ -20,6 +20,20 @@ type TagMaker interface {
 	MakeTag(structureType reflect.Type, fieldIndex int) reflect.StructTag
 }
 
+// A FieldMaker interface is used by the ConvertFields function to generate new structs.
+type FieldMaker interface {
+	// MakeField makes struct fields with the given type and tag.
+	// Result should depends on constant parameters of creation of the TagMaker and parameters
+	// passed to the MakeTag. The MakeTag should not produce side effects (like a pure function).
+	MakeField(oldType reflect.Type, newType reflect.Type, oldTag reflect.StructTag, newTag reflect.StructTag) (reflect.Type, reflect.StructTag)
+}
+
+type noopFieldMaker struct {}
+
+func (f *noopFieldMaker) MakeField(oldType reflect.Type, newType reflect.Type, oldTag reflect.StructTag, newTag reflect.StructTag) (reflect.Type, reflect.StructTag) {
+	return newType, newTag
+}
+
 // Convert converts the given interface p, to a runtime-generated type.
 // The type is generated on base of source type by the next rules:
 //   - Analogous type with custom tags is generated for structures.
@@ -55,14 +69,23 @@ type TagMaker interface {
 func Convert(p interface{}, maker TagMaker) interface{} {
 	strPtrVal := reflect.ValueOf(p)
 	// TODO(yar): check type (pointer to the structure)
-	newType := getType(strPtrVal.Type().Elem(), maker)
+	newType := getType(strPtrVal.Type().Elem(), maker, &noopFieldMaker{}, false)
 	newPtrVal := reflect.NewAt(newType, unsafe.Pointer(strPtrVal.Pointer()))
+	return newPtrVal.Interface()
+}
+
+func ConvertFields(p interface{}, tagMaker TagMaker, fieldMaker FieldMaker) interface{} {
+	strPtrVal := reflect.ValueOf(p)
+	// TODO(yar): check type (pointer to the structure)
+	newType := getType(strPtrVal.Type().Elem(), tagMaker, fieldMaker, true)
+	newPtrVal := reflect.New(newType) // If type may be different size, we can't update current struct via pointer
 	return newPtrVal.Interface()
 }
 
 type cacheKey struct {
 	reflect.Type
 	TagMaker
+	FieldMaker
 }
 
 var cache = struct {
@@ -72,15 +95,15 @@ var cache = struct {
 	m: make(map[cacheKey]reflect.Type),
 }
 
-func getType(structType reflect.Type, maker TagMaker) reflect.Type {
+func getType(structType reflect.Type, tagMaker TagMaker, fieldMaker FieldMaker, resizable bool) reflect.Type {
 	// TODO(yar): Improve synchronization for cases when one analogue
 	// is produced concurently by different goroutines in the same time
-	key := cacheKey{structType, maker}
+	key := cacheKey{structType, tagMaker, fieldMaker}
 	cache.RLock()
 	t, ok := cache.m[key]
 	cache.RUnlock()
 	if !ok {
-		t = makeType(structType, maker)
+		t = makeType(structType, tagMaker, fieldMaker, resizable)
 		cache.Lock()
 		cache.m[key] = t
 		cache.Unlock()
@@ -89,18 +112,18 @@ func getType(structType reflect.Type, maker TagMaker) reflect.Type {
 }
 
 // TODO(yar): Optimize cases when type is not modified.
-func makeType(t reflect.Type, maker TagMaker) reflect.Type {
+func makeType(t reflect.Type, tagMaker TagMaker, fieldMaker FieldMaker, resizable bool) reflect.Type {
 	switch t.Kind() {
 	case reflect.Struct:
-		return makeStructType(t, maker)
+		return makeStructType(t, tagMaker, fieldMaker, resizable)
 	case reflect.Ptr:
-		return reflect.PtrTo(getType(t.Elem(), maker))
+		return reflect.PtrTo(getType(t.Elem(), tagMaker, fieldMaker, resizable))
 	case reflect.Array:
-		return reflect.ArrayOf(t.Len(), getType(t.Elem(), maker))
+		return reflect.ArrayOf(t.Len(), getType(t.Elem(), tagMaker, fieldMaker, resizable))
 	case reflect.Slice:
-		return reflect.SliceOf(getType(t.Elem(), maker))
+		return reflect.SliceOf(getType(t.Elem(), tagMaker, fieldMaker, resizable))
 	case reflect.Map:
-		return reflect.MapOf(getType(t.Key(), maker), getType(t.Elem(), maker))
+		return reflect.MapOf(getType(t.Key(), tagMaker, fieldMaker, resizable), getType(t.Elem(), tagMaker, fieldMaker, resizable))
 	case
 		reflect.Chan,
 		reflect.Func,
@@ -113,7 +136,7 @@ func makeType(t reflect.Type, maker TagMaker) reflect.Type {
 	}
 }
 
-func makeStructType(structType reflect.Type, maker TagMaker) reflect.Type {
+func makeStructType(structType reflect.Type, tagMaker TagMaker, fieldMaker FieldMaker, resizable bool) reflect.Type {
 	if structType.NumField() == 0 {
 		return structType
 	}
@@ -124,13 +147,14 @@ func makeStructType(structType reflect.Type, maker TagMaker) reflect.Type {
 		strField := structType.Field(i)
 		if isExported(strField.Name) {
 			oldType := strField.Type
-			newType := getType(oldType, maker)
+			newType := getType(oldType, tagMaker, fieldMaker, resizable)
+			oldTag := strField.Tag
+			newTag := tagMaker.MakeTag(structType, i)
+			newType, newTag = fieldMaker.MakeField(oldType, newType, oldTag, newTag)
 			strField.Type = newType
 			if oldType != newType {
 				changed = true
 			}
-			oldTag := strField.Tag
-			newTag := maker.MakeTag(structType, i)
 			strField.Tag = newTag
 			if oldTag != newTag {
 				changed = true
@@ -152,7 +176,9 @@ func makeStructType(structType reflect.Type, maker TagMaker) reflect.Type {
 		panic(fmt.Sprintf("unable to change tags for type %s, because it contains unexported fields", structType))
 	}
 	newType := reflect.StructOf(fields)
-	compareStructTypes(structType, newType)
+	if !resizable {
+		compareStructTypes(structType, newType)
+	}
 	return newType
 }
 
